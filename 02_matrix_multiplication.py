@@ -81,7 +81,8 @@ def matrix_multiplication_kernel_v2(
         a_sub = tl.load(a_ptrs, mask=a_mask, other=0.0)
         b_sub = tl.load(b_ptrs, mask=b_mask, other=0.0)
 
-        acc += tl.dot(a_sub, b_sub)
+        # forbidden allow_tf32 is important for accuracy
+        acc += tl.dot(a_sub, b_sub, allow_tf32=False)
 
     c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_k[None, :] * stride_ck)
     c_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
@@ -126,9 +127,6 @@ if __name__ == "__main__":
     triton_output = torch.empty((M, K), device='cuda').to(torch.float32)
     solve(a, b, triton_output, M, N, K)
     print("Test 1:", "✅" if torch.allclose(triton_output, torch_output, atol=1e-3, rtol=1e-3) else "❌")
-    print("triton_output", triton_output)
-    print("torch_output", torch_output)
-
     # 测试用例2：全1矩阵
     M, N, K = 3, 3, 3
     a = torch.ones((M, N), device='cuda')
