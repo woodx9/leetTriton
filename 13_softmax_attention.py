@@ -80,8 +80,8 @@ def solve(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tenso
         Q, K, V, output,
         M, N, d,
         BLOCK_SIZE_M=1,
-        BLOCK_SIZE_N=min(128, N),    
-        BLOCK_SIZE_D=d                
+        BLOCK_SIZE_N=triton.next_power_of_2(min(128, N)),    
+        BLOCK_SIZE_D=triton.next_power_of_2(d)                
     )
 
 def torch_softmax_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor):
