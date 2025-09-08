@@ -118,9 +118,9 @@ def benchmark_multi_head_attention():
     print("- GPT-2 Small/Medium/Large")
     print("- BERT Base/Large") 
     print("- LLaMA configurations")
-    print("=" * 80)
-    print(f"{'Batch Size':<10} {'Seq Len':<8} {'d_model':<8} {'Heads':<6} {'Model Type':<15} {'Triton (ms)':<12} {'PyTorch (ms)':<13} {'Speedup':<8}")
-    print("-" * 80)
+    print("=" * 100)
+    print(f"{'Batch Size':<10} {'Seq Len':<8} {'d_model':<8} {'Heads':<6} {'Model Type':<15} {'Triton (ms)':<12} {'PyTorch (ms)':<13} {'Speedup':<8} {'Max Error':<12}")
+    print("-" * 100)
     
     # 测试配置: (batch_size, seq_len, d_model, num_heads, model_type)
     # 基于流行模型的真实配置
@@ -211,7 +211,7 @@ def benchmark_multi_head_attention():
             torch.cuda.synchronize()
             triton_time = (time.time() - start_time) * 1000 / test_runs
             
-            # 测试PyTorch性能
+            # 测试PyTorch性能并获取最终结果用于误差计算
             start_time = time.time()
             for _ in range(test_runs):
                 with torch.no_grad():
@@ -219,18 +219,28 @@ def benchmark_multi_head_attention():
             torch.cuda.synchronize()
             torch_time = (time.time() - start_time) * 1000 / test_runs
             
+            # 计算最大误差 - 重新计算一次确保结果准确
+            output_triton.zero_()
+            solve(Q, K, V, output_triton, N, d_model, h)
+            with torch.no_grad():
+                output_torch_final = multihead_attn(Q, K, V, need_weights=False)[0]
+            
+            # 计算最大误差
+            max_error = torch.max(torch.abs(output_triton - output_torch_final)).item()
+            
             # 计算加速比
             speedup = torch_time / triton_time if triton_time > 0 else 0
             
-            print(f"{B:<10} {N:<8} {d_model:<8} {h:<6} {model_type:<15} {triton_time:<12.2f} {torch_time:<13.2f} {speedup:<8.2f}x")
+            print(f"{B:<10} {N:<8} {d_model:<8} {h:<6} {model_type:<15} {triton_time:<12.2f} {torch_time:<13.2f} {speedup:<8.2f}x {max_error:<12.2e}")
             
         except Exception as e:
             print(f"Error with config (B={B}, N={N}, d_model={d_model}, h={h}, {model_type}): {str(e)}")
             continue
     
-    print("-" * 80)
+    print("-" * 100)
     print("Note: Speedup = PyTorch time / Triton time")
     print("Values > 1.0 indicate Triton is faster")
+    print("Max Error shows the maximum absolute difference between Triton and PyTorch outputs")
 
 
 if __name__ == "__main__":
