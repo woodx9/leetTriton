@@ -3,7 +3,9 @@ import triton
 import triton.language as tl
 import time
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+import math
 
 # 简单处理，复用softmax attention
 @triton.jit
@@ -63,26 +65,18 @@ def softmax_attention_kernel(
     tl.store(Out_ptr + row * D + offs_d, out, mask=mask_q)
 
 # Q, K, V, output are tensors on the GPU
-# Q, K, V [B, N, d_model]
+# Q, K, V [B, h, N, d_head] 
 # d_model // h = d_head
 def solve(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tensor, N: int, d_model: int, h: int):
-    """
-    Q, K, V: [B, N, d_model]
-    output:  [B, N, d_model]
-    N: sequence length
-    d_model: model dim
-    h: num heads
-    """
-     
     B = Q.shape[0]
     d_head = d_model // h
-    M = N   # query_len == key_len
+    M = N
 
-    # reshape to multi-head form [B, h, N, d_head]
-    Qh = Q.view(B, N, h, d_head).transpose(1, 2).contiguous()  # [B, h, N, d_head]
-    Kh = K.view(B, N, h, d_head).transpose(1, 2).contiguous()  # [B, h, N, d_head]
-    Vh = V.view(B, N, h, d_head).transpose(1, 2).contiguous()  # [B, h, N, d_head]
-    Oh = output.view(B, N, h, d_head).transpose(1, 2).contiguous()  # [B, h, N, d_head]
+    # [B, h, N, d_head]
+    Qh = Q.contiguous()
+    Kh = K.contiguous()
+    Vh = V.contiguous()
+    Oh = output.contiguous()
 
     # flatten batch*head
     Qf = Qh.reshape(B * h, N, d_head)
@@ -90,77 +84,102 @@ def solve(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tenso
     Vf = Vh.reshape(B * h, N, d_head)
     Of = Oh.reshape(B * h, N, d_head)
 
-    grid = (B * h * M,)
-    softmax_attention_kernel[grid](
-        Qf, Kf, Vf, Of,
-        M, N, d_head,
-        BLOCK_SIZE_M=1,
-        BLOCK_SIZE_N=triton.next_power_of_2(min(128, N)),
-        BLOCK_SIZE_D=triton.next_power_of_2(d_head),
-    )
+    # kernel期望的是每个(batch*head)组合处理M个查询
+    for batch_head_idx in range(B * h):
+        grid = (M,)  # 每次只处理一个(batch,head)的M个查询
+        softmax_attention_kernel[grid](
+            Qf[batch_head_idx], Kf[batch_head_idx], Vf[batch_head_idx], Of[batch_head_idx],
+            M, N, d_head,
+            BLOCK_SIZE_M=1,
+            BLOCK_SIZE_N=triton.next_power_of_2(min(128, N)),
+            BLOCK_SIZE_D=triton.next_power_of_2(d_head),
+        )
 
-    # reshape back to [B, N, d_model]
-    output.copy_(Oh.transpose(1, 2).reshape(B, N, d_model))
+    # reshape back
+    output.copy_(Oh)
 
+class TritonMHA(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model) 
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+        
+    def forward(self, query, key, value):
+        batch_size, seq_len = query.size(0), query.size(1)
+        
+        # 1. 输入投影
+        Q = self.W_q(query)
+        K = self.W_k(key)
+        V = self.W_v(value)
+        
+        # 2. 重塑为多头形式
+        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        
+        # 确保连续性
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+        
+        # 3. Triton注意力计算
+        # 3. Triton注意力计算
+        attention_output = torch.zeros_like(Q)
+        solve(Q, K, V, attention_output, seq_len, self.d_model, self.num_heads)
+        
+        # 4. 合并多头
+        attention_output = attention_output.transpose(1, 2).contiguous()
+        attention_output = attention_output.view(batch_size, seq_len, self.d_model)
+        
+        # 5. 输出投影
+        output = self.W_o(attention_output)
+        
+        return output, None
 
-def benchmark_multi_head_attention():
+def benchmark_torch_vs_triton_mha():
     """
-    测试Triton实现的Multi Head Attention与PyTorch官方MultiheadAttention的性能对比
-    覆盖不同的矩阵大小范围
+    比较PyTorch标准MultiHeadAttention和Triton TritonMHA的性能和精度
+    使用与debug函数相同的调用方式确保公平对比
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cpu":
         print("CUDA is not available, running on CPU")
         return
     
-    print("Multi Head Attention Performance Benchmark")
-    print("Testing with real-world model configurations:")
-    print("- GPT-2 Small/Medium/Large")
-    print("- BERT Base/Large") 
-    print("- LLaMA configurations")
+    print("PyTorch vs Triton MultiHeadAttention Benchmark")
     print("=" * 100)
-    print(f"{'Batch Size':<10} {'Seq Len':<8} {'d_model':<8} {'Heads':<6} {'Model Type':<15} {'Triton (ms)':<12} {'PyTorch (ms)':<13} {'Speedup':<8} {'Max Error':<12}")
+    print(f"{'Batch Size':<10} {'Seq Len':<8} {'d_model':<8} {'Heads':<6} {'Model Type':<15} {'PyTorch (ms)':<13} {'Triton (ms)':<12} {'Speedup':<8} {'Max Error':<12} {'Mean Error':<12}")
     print("-" * 100)
     
-    # 测试配置: (batch_size, seq_len, d_model, num_heads, model_type)
-    # 基于流行模型的真实配置
+    # 测试配置
     test_configs = [
-        # GPT-2 Small配置 (d_model=768, heads=12)
-        (1, 512, 768, 12, "GPT-2 Small"),
+        # 小规模测试
+        (1, 32, 256, 8, "Small"),
+        (2, 64, 256, 8, "Small"),
+        
+        # 中规模测试
+        (1, 128, 512, 8, "Medium"),
+        (2, 256, 512, 8, "Medium"),
+        
+        # GPT-2 Small风格
+        (1, 256, 768, 12, "GPT-2 Small"),
         (2, 512, 768, 12, "GPT-2 Small"),
-        (4, 512, 768, 12, "GPT-2 Small"),
-        (1, 1024, 768, 12, "GPT-2 Small"),
         
-        # GPT-2 Medium配置 (d_model=1024, heads=16)
-        (1, 512, 1024, 16, "GPT-2 Medium"),
-        (2, 512, 1024, 16, "GPT-2 Medium"),
-        (1, 1024, 1024, 16, "GPT-2 Medium"),
+        # BERT Base风格
+        (4, 128, 768, 12, "BERT Base"),
         
-        # GPT-2 Large配置 (d_model=1280, heads=20)
-        (1, 512, 1280, 20, "GPT-2 Large"),
-        (2, 512, 1280, 20, "GPT-2 Large"),
-        
-        # BERT Base配置 (d_model=768, heads=12)
-        (1, 256, 768, 12, "BERT Base"),
-        (8, 256, 768, 12, "BERT Base"),
-        (16, 256, 768, 12, "BERT Base"),
-        
-        # BERT Large配置 (d_model=1024, heads=16)
-        (1, 256, 1024, 16, "BERT Large"),
-        (8, 256, 1024, 16, "BERT Large"),
-        
-        # LLaMA配置 (d_model=4096, heads=32)
-        (1, 512, 4096, 32, "LLaMA"),
-        (2, 512, 4096, 32, "LLaMA"),
-        
-        # 较小的测试配置
-        (1, 128, 512, 8, "Small Test"),
-        (1, 256, 512, 8, "Small Test"),
-        (4, 128, 512, 8, "Small Test"),
+        # 更大规模测试
+        (1, 512, 1024, 16, "Large"),
     ]
     
-    warmup_runs = 5
-    test_runs = 20
+    warmup_runs = 3
+    test_runs = 10
     
     for B, N, d_model, h, model_type in test_configs:
         try:
@@ -168,80 +187,106 @@ def benchmark_multi_head_attention():
             if d_model % h != 0:
                 continue
                 
-            d_head = d_model // h
-            
             # 创建测试数据
-            Q = torch.randn(B, N, d_model, device=device, dtype=torch.float32)
-            K = torch.randn(B, N, d_model, device=device, dtype=torch.float32)
-            V = torch.randn(B, N, d_model, device=device, dtype=torch.float32)
+            torch.manual_seed(42)  # 固定随机种子确保可重复性
+            x = torch.randn(B, N, d_model, device=device, dtype=torch.float32)
             
-            # Triton版本输出
-            output_triton = torch.zeros_like(Q)
-            
-            # PyTorch版本
-            multihead_attn = nn.MultiheadAttention(
-                embed_dim=d_model,
-                num_heads=h,
-                batch_first=True,
-                bias=False
+            # 创建模型 - 使用与debug相同的方式
+            torch_mha = nn.MultiheadAttention(
+                embed_dim=d_model, 
+                num_heads=h, 
+                dropout=0.0,
+                batch_first=True
             ).to(device)
             
-            # 设置权重为单位矩阵 (简化比较)
+            triton_mha = TritonMHA(d_model, h, dropout=0.0).to(device)
+            
+            # 权重同步 - 按照debug函数的方式
             with torch.no_grad():
-                multihead_attn.in_proj_weight.copy_(torch.eye(3 * d_model, d_model).to(device))
-                multihead_attn.out_proj.weight.copy_(torch.eye(d_model).to(device))
+                # PyTorch MHA使用的是in_proj_weight和out_proj
+                # 需要将其分解为Q、K、V权重
+                if hasattr(torch_mha, 'in_proj_weight') and torch_mha.in_proj_weight is not None:
+                    # 分解in_proj_weight
+                    W_q_weight = torch_mha.in_proj_weight[:d_model, :]
+                    W_k_weight = torch_mha.in_proj_weight[d_model:2*d_model, :]  
+                    W_v_weight = torch_mha.in_proj_weight[2*d_model:, :]
+                    
+                    triton_mha.W_q.weight.copy_(W_q_weight)
+                    triton_mha.W_k.weight.copy_(W_k_weight)
+                    triton_mha.W_v.weight.copy_(W_v_weight)
+                    
+                    # bias处理
+                    if torch_mha.in_proj_bias is not None:
+                        triton_mha.W_q.bias.copy_(torch_mha.in_proj_bias[:d_model])
+                        triton_mha.W_k.bias.copy_(torch_mha.in_proj_bias[d_model:2*d_model])
+                        triton_mha.W_v.bias.copy_(torch_mha.in_proj_bias[2*d_model:])
+                    
+                    # 输出投影
+                    triton_mha.W_o.weight.copy_(torch_mha.out_proj.weight)
+                    if torch_mha.out_proj.bias is not None:
+                        triton_mha.W_o.bias.copy_(torch_mha.out_proj.bias)
+            
+            # 设置为评估模式
+            torch_mha.eval()
+            triton_mha.eval()
             
             # Warmup
             for _ in range(warmup_runs):
-                # Triton warmup
-                output_triton.zero_()
-                solve(Q, K, V, output_triton, N, d_model, h)
-                
-                # PyTorch warmup
                 with torch.no_grad():
-                    _ = multihead_attn(Q, K, V, need_weights=False)[0]
+                    # PyTorch warmup
+                    _ = torch_mha(x, x, x, need_weights=False)[0]
+                    
+                    # Triton warmup  
+                    _ = triton_mha(x, x, x)[0]
             
             torch.cuda.synchronize()
+            
+            # 测试PyTorch性能
+            start_time = time.time()
+            for _ in range(test_runs):
+                with torch.no_grad():
+                    torch_output = torch_mha(x, x, x, need_weights=False)[0]
+            torch.cuda.synchronize()
+            torch_time = (time.time() - start_time) * 1000 / test_runs
             
             # 测试Triton性能
             start_time = time.time()
             for _ in range(test_runs):
-                output_triton.zero_()
-                solve(Q, K, V, output_triton, N, d_model, h)
+                with torch.no_grad():
+                    triton_output = triton_mha(x, x, x)[0]
             torch.cuda.synchronize()
             triton_time = (time.time() - start_time) * 1000 / test_runs
             
-            # 测试PyTorch性能并获取最终结果用于误差计算
-            start_time = time.time()
-            for _ in range(test_runs):
-                with torch.no_grad():
-                    output_torch = multihead_attn(Q, K, V, need_weights=False)[0]
-            torch.cuda.synchronize()
-            torch_time = (time.time() - start_time) * 1000 / test_runs
-            
-            # 计算最大误差 - 重新计算一次确保结果准确
-            output_triton.zero_()
-            solve(Q, K, V, output_triton, N, d_model, h)
+            # 计算数值误差 - 重新计算确保结果准确
             with torch.no_grad():
-                output_torch_final = multihead_attn(Q, K, V, need_weights=False)[0]
+                torch_final = torch_mha(x, x, x, need_weights=False)[0]
+                triton_final = triton_mha(x, x, x)[0]
             
-            # 计算最大误差
-            max_error = torch.max(torch.abs(output_triton - output_torch_final)).item()
+            # 计算误差
+            abs_error = torch.abs(torch_final - triton_final)
+            max_error = torch.max(abs_error).item()
+            mean_error = torch.mean(abs_error).item()
             
             # 计算加速比
             speedup = torch_time / triton_time if triton_time > 0 else 0
             
-            print(f"{B:<10} {N:<8} {d_model:<8} {h:<6} {model_type:<15} {triton_time:<12.2f} {torch_time:<13.2f} {speedup:<8.2f}x {max_error:<12.2e}")
+            print(f"{B:<10} {N:<8} {d_model:<8} {h:<6} {model_type:<15} {torch_time:<13.2f} {triton_time:<12.2f} {speedup:<8.2f}x {max_error:<12.2e} {mean_error:<12.2e}")
+            
+            # 如果误差过大，打印警告
+            if max_error > 1e-4:
+                print(f"  WARNING: Large numerical error detected! Max: {max_error:.2e}, Mean: {mean_error:.2e}")
             
         except Exception as e:
             print(f"Error with config (B={B}, N={N}, d_model={d_model}, h={h}, {model_type}): {str(e)}")
             continue
     
     print("-" * 100)
-    print("Note: Speedup = PyTorch time / Triton time")
-    print("Values > 1.0 indicate Triton is faster")
-    print("Max Error shows the maximum absolute difference between Triton and PyTorch outputs")
+    print("Note:")
+    print("- Speedup = PyTorch time / Triton time (values > 1.0 indicate Triton is faster)")
+    print("- Max Error: Maximum absolute difference between outputs")
+    print("- Mean Error: Average absolute difference between outputs") 
+    print("- Weights are synchronized to ensure fair comparison")
 
 
 if __name__ == "__main__":
-    benchmark_multi_head_attention()
+    benchmark_torch_vs_triton_mha()
