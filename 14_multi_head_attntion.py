@@ -11,16 +11,27 @@ import math
 @triton.jit
 def softmax_attention_kernel(
     Q_ptr, K_ptr, V_ptr, Out_ptr,
-    M, N, D,
+    B_H, M, N, D,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr
 ):
-    row = tl.program_id(0)
+    pid = tl.program_id(0)
+    
+    # 添加这两行来正确处理索引
+    batch_head_idx = pid // M  
+    row = pid % M              
+    
+    # 如果超出范围就返回
+    if batch_head_idx >= B_H:
+        return
 
     offs_d = tl.arange(0, BLOCK_SIZE_D)
     mask_q = offs_d < D
-    q = tl.load(Q_ptr + row * D + offs_d, mask=mask_q, other=0.0)
+    
+    # 修改数据访问：加上batch_head偏移
+    q_offset = batch_head_idx * M * D + row * D
+    q = tl.load(Q_ptr + q_offset + offs_d, mask=mask_q, other=0.0)
     q = tl.reshape(q, [1, BLOCK_SIZE_D])
 
     out = tl.zeros([BLOCK_SIZE_D], dtype=tl.float32)
@@ -29,12 +40,12 @@ def softmax_attention_kernel(
     total_exp_sum = 0.0
     scale = tl.sqrt(tl.cast(D, tl.float32))
 
-    # 全局max
     for j in range(0, N, BLOCK_SIZE_N):
         offs_n = j + tl.arange(0, BLOCK_SIZE_N)
         mask_kv = (offs_n[:, None] < N) & (offs_d[None, :] < D)
         
-        k = tl.load(K_ptr + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
+        k_base_offset = batch_head_idx * N * D
+        k = tl.load(K_ptr + k_base_offset + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
         s = tl.sum(k * q, axis=1) / scale
         
         mask_n = offs_n < N
@@ -47,8 +58,10 @@ def softmax_attention_kernel(
         offs_n = j + tl.arange(0, BLOCK_SIZE_N)
         mask_kv = (offs_n[:, None] < N) & (offs_d[None, :] < D)
         
-        k = tl.load(K_ptr + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
-        v = tl.load(V_ptr + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
+        k_base_offset = batch_head_idx * N * D
+        v_base_offset = batch_head_idx * N * D
+        k = tl.load(K_ptr + k_base_offset + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
+        v = tl.load(V_ptr + v_base_offset + offs_n[:, None] * D + offs_d[None, :], mask=mask_kv, other=0.0)
         
         s = tl.sum(k * q, axis=1) / scale
         mask_n = offs_n < N
@@ -60,9 +73,10 @@ def softmax_attention_kernel(
         w = tl.reshape(exp_s, [BLOCK_SIZE_N, 1])
         out += tl.sum(w * v, axis=0)
 
-    # softmax里 / total_exp_sum
     out = out / total_exp_sum
-    tl.store(Out_ptr + row * D + offs_d, out, mask=mask_q)
+    
+    o_offset = batch_head_idx * M * D + row * D
+    tl.store(Out_ptr + o_offset + offs_d, out, mask=mask_q)
 
 # Q, K, V, output are tensors on the GPU
 # Q, K, V [B, h, N, d_head] 
@@ -84,17 +98,14 @@ def solve(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, output: torch.Tenso
     Vf = Vh.reshape(B * h, N, d_head)
     Of = Oh.reshape(B * h, N, d_head)
 
-    # kernel期望的是每个(batch*head)组合处理M个查询
-    for batch_head_idx in range(B * h):
-        grid = (M,)  # 每次只处理一个(batch,head)的M个查询
-        softmax_attention_kernel[grid](
-            Qf[batch_head_idx], Kf[batch_head_idx], Vf[batch_head_idx], Of[batch_head_idx],
-            M, N, d_head,
-            BLOCK_SIZE_M=1,
-            BLOCK_SIZE_N=triton.next_power_of_2(min(128, N)),
-            BLOCK_SIZE_D=triton.next_power_of_2(d_head),
-        )
-
+    grid = (B * h * M,)
+    softmax_attention_kernel[grid](
+        Qf, Kf, Vf, Of,
+        B * h, M, N, d_head,
+        BLOCK_SIZE_M=1,
+        BLOCK_SIZE_N=triton.next_power_of_2(min(128, N)),
+        BLOCK_SIZE_D=triton.next_power_of_2(d_head),
+    )
     # reshape back
     output.copy_(Oh)
 
